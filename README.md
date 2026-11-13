@@ -197,44 +197,62 @@ You can upload the script either via the browser editor or using `clasp`.
 
 ## Step 5: Configure MacroDroid on Android
 
-To avoid missing transactions (some banks/cards don't populate amounts inside Google Wallet notifications, while contactless Wallet payments may appear before or separately from card SMSes), configure **two triggers** (or two separate macros) pointing to the same Web App URL. `LockService` + deduplication Rules A & B automatically prevent double entries.
+To avoid missing transactions (some banks/cards don't populate amounts inside Google Wallet notifications, while contactless Wallet payments may appear before or separately from card SMSes), configure a single unified macro (`Wallet Backup`) that listens to both **App Notifications** and **Bank/Card SMSes** and routes them into one `HTTP Request (GET)` action. `LockService` + deduplication Rules A & B automatically prevent double entries.
 
-### Macro 1: Bank / Credit Card SMS Trigger
-1. **Triggers (Red):**
+### 1. Triggers (Red)
+Add three triggers to the macro:
+
+1. **Google Wallet Notification:**
+   - **Device Events → Notification → Notification Received**
+   - **Application:** `Google Wallet`
+   - **Text Content:** `Excludes` → `Preparing your receipt` *(the script also rejects this server-side as a fallback)*
+2. **Bank / Credit Card SMS:**
    - **SMS / Messaging → SMS Received**
    - **Select Contact:** `[Any Number]` *(cards often use alphabetical shortcodes like `Isracard`, `Cal`, `MAX`, or changing numbers)*
    - **Content:** `Contains` → **`בכרטיס`**
      > **Important:** Use **`בכרטיס`** (without the final `ך`), **NOT** `בכרטיסך`! Isracard writes `"בכרטיסך"` while Cal writes `"בכרטיס"`. Matching `"בכרטיס"` captures **both** issuers.
-     > *(Alternatively, leave the SMS content filter blank or match multiple keywords like `עסקה` / `הסיבוס שלך` — the script's two-layer ad filter will safely ignore non-transaction SMSes.)*
-2. **Actions (Blue):**
-   - **Web Interactions → HTTP Request**
-   - **Request Method:** `GET`
-   - **URL:**
-     ```text
-     https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec?merchant={sms_number}&text={sms_message}
-     ```
-   - **Query Parameters / URL Encoding:** Make sure MacroDroid **URL-encodes** `{sms_number}` and `{sms_message}` (use MacroDroid's **Parameters** tab with `URL Encode` enabled, or wrap values if using raw URL mode) so Hebrew characters, `+`, `%`, `&`, and newlines don't break the query string.
-   - **Timeout:** `45` seconds (allows time for `LockService` wait + Gemini Google Search lookup).
-   - **Save Response** *(optional)*: Check for `Success` vs `Ignored: ...` during initial testing.
-
-### Macro 2: App Notification Trigger (Google Wallet / Card Apps / Cibus)
-1. **Triggers (Red):**
+3. **Cibus / Pluxee (and optional card apps):**
    - **Device Events → Notification → Notification Received**
-   - **Select Application(s):** **Google Wallet**, **Isracard**, **Cal**, **MAX**, **Cibus / Pluxee** (whichever apps send purchase push alerts on your phone).
-   - **Text Content:** `Any` *(do not worry about `"Preparing your receipt..."` — `doGet` filters it out)*.
-2. **Actions (Blue):**
-   - **Web Interactions → HTTP Request**
-   - **Request Method:** `GET`
-   - **URL:**
-     ```text
-     https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec?merchant={not_title}&text={notification}
-     ```
-   - Enable **URL Encode** on parameters and set timeout to `45` seconds.
+   - **Application:** `Cibus-Pluxee` *(you can also add `Isracard`, `Cal`, or `MAX` if you prefer app push notifications)*
+   - **Text Content:** `Any Content`
 
-### Recommended Android System Settings for Reliability
+### 2. Local Variables
+In the macro's **Local Variables** drawer (bottom bar), create two **String** variables:
+- `clean_merchant`
+- `clean_text`
+
+### 3. Actions (Blue)
+Add the following actions in order:
+
+1. **Set Local Variable (`clean_merchant`):** `(empty)`
+2. **Set Local Variable (`clean_text`):** `(empty)`
+3. **If (`Trigger Fired`):** `SMS from Any Number: Contains: בכרטיס`
+   - **Set Local Variable (`clean_merchant`):** `{sms_number}`
+   - **Set Local Variable (`clean_text`):** `{sms_message}`
+4. **Else If (`Trigger Fired`):** `Notification Received (Google Wallet)` **OR** `Notification Received (Cibus-Pluxee)`
+   - **Set Local Variable (`clean_merchant`):** `{not_title}`
+   - **Set Local Variable (`clean_text`):** `{notification}`
+5. **End If**
+6. **Web Interactions → HTTP Request (GET):**
+   - **Settings tab → Request Method:** `GET`
+   - **Settings tab → URL:**
+     ```text
+     https://script.google.com/macros/s/<YOUR_DEPLOYMENT_ID>/exec
+     ```
+   - **Settings tab → Request timeout:** `45` seconds *(allows headroom for `LockService` wait + Gemini Google Search lookup)*
+   - **Query Params tab:**
+     - `merchant` = `{lv=clean_merchant}`
+     - `text` = `{lv=clean_text}`
+     *(MacroDroid automatically URL-encodes values in the `Query Params` tab so Hebrew text, `%`, `&`, `+`, and newlines don't break the request. If your version shows a `URL Encode` checkbox, keep it enabled.)*
+
+### 4. Recommended Android System Settings for Reliability
 - **Battery Optimization:** Set MacroDroid to **Unrestricted** (Settings → Apps → MacroDroid → Battery → Unrestricted) so Android does not kill triggers in the background.
 - **Permissions:** Grant MacroDroid **Notification Access**, **SMS**, and **Allow background data usage**.
 - **Verify:** Make a small test purchase or send a test HTTP GET from MacroDroid, then check the **`Debug`** tab in your Google Sheet to confirm the payload arrived.
+
+Your macro should look like this:
+
+<img src="docs/macrodroid-example.png" alt="MacroDroid Wallet Backup Macro" width="320" />
 
 ---
 
@@ -412,3 +430,4 @@ You can also run `runUnitTests()` directly inside the Apps Script editor for a q
 - **Fix:** Keep Column D's dropdown options configured in the Google Sheets UI and keep `CATEGORIES` in [`parsing.js`](parsing.js) in sync manually.
 
 </details>
+
