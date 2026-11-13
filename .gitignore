@@ -1,0 +1,14 @@
+# Google Apps Script / clasp project binding & local auth (keep private)
+.clasp.json
+.clasprc.json
+
+# Environment & local secrets
+.env
+.env.*
+*.local
+
+# Dependencies & OS / editor artifacts
+node_modules/
+.DS_Store
+Thumbs.db
+*.log

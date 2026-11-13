@@ -1,0 +1,6 @@
+**/**
+!appsscript.json
+!*.js
+!*.ts
+!*.html
+tests.js
