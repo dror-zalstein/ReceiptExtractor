@@ -13,7 +13,7 @@ flowchart TD
     A["Android Phone<br/>(Google Wallet / Card Apps / Bank SMS)"] -->|"Notification or SMS Trigger"| B["MacroDroid<br/>HTTP GET (?merchant=...&text=...)"]
     B -->|"HTTPS GET"| C["Google Apps Script Web App (doGet)"]
     C --> D["Log raw params to 'Debug' tab"]
-    D --> E["Spam & Two-Layer Ad Filter<br/>(findAdReason)"]
+    D --> E["Spam & Multi-Layer Ad Filter<br/>(findAdReason)"]
     E -->|"Promo / No Amount"| X["Return 'Ignored: ...'"]
     E -->|"Valid Transaction"| F["Parse Merchant & Amount<br/>+ Live FX Conversion to ILS"]
     F --> G{"Match in 'Categories' Cache?"}
@@ -37,7 +37,7 @@ flowchart TD
 | [`קוד.js`](קוד.js) | Apps Script entry points (`doGet`, `onOpen`, `checkAndNotify`), `LockService` deduplication, Gemini API call, currency conversion, and `Wallet Tools` repair utilities. *(Named in Hebrew to match the bound Apps Script project file.)* |
 | [`parsing.js`](parsing.js) | Pure parsing and validation helpers (`findAdReason`, `parseMerchant`, `extractAmount`, `parseLocaleNumber`, `isMerchantMatch`, `normalizeCategory`, `CATEGORIES`). Contains zero Apps Script calls so it runs identically in Node and Apps Script. |
 | [`appsscript.json`](appsscript.json) | Apps Script manifest (`Asia/Jerusalem` timezone, V8 runtime, Web App `USER_DEPLOYING` + `ANYONE_ANONYMOUS`). |
-| [`tests.js`](tests.js) | Local Node.js test suite (59 tests) that loads `parsing.js` and `קוד.js` into a mocked Apps Script `vm` context. Excluded from `clasp push` via `.claspignore`. |
+| [`tests.js`](tests.js) | Local Node.js test suite (62 tests) that loads `parsing.js` and `קוד.js` into a mocked Apps Script `vm` context. Excluded from `clasp push` via `.claspignore`. |
 | [`.clasp.json.example`](.clasp.json.example) | Template for binding [`clasp`](https://github.com/google/clasp) to your own Apps Script project. Real `.clasp.json` is gitignored. |
 | [`.claspignore`](.claspignore) | Ensures only `appsscript.json`, `parsing.js`, and `קוד.js` are pushed to Apps Script. |
 | [`CONTEXT.md`](CONTEXT.md) | Architectural invariants and "do not touch" safeguards for contributors. |
@@ -267,7 +267,7 @@ When you open the spreadsheet, `onOpen()` adds a **`Wallet Tools`** menu with ma
 | **Fix Misparsed Merchants** | `fixMisparsedMerchants()` | Re-runs `parseMerchant()` on Column E (`Raw Text`) across all `Transactions` rows and updates matching categories from cache. |
 | **Fix Zero Amounts** | `fixZeroAmounts()` | Re-runs `extractAmount()` on rows where `Amount` is `0` or blank. |
 | **Fix CZK Transactions (June 12-17)** | `fixCZKTransactions()` | Example one-time repair tool for a specific trip window where `CZK` transactions were saved without conversion. Skips rows already tagged `[Orig:]`. |
-| **Remove SMS Ad Transactions** | `fixAdTransactions()` | Retroactively deletes rows from `Transactions` that match the live two-layer ad filter (`findAdReason`). |
+| **Remove SMS Ad Transactions** | `fixAdTransactions()` | Retroactively deletes rows from `Transactions` that match the live multi-layer ad filter (`findAdReason`). |
 | **Fix Unconverted Foreign Transactions** | `fixUnconvertedForeignTransactions()` | Finds unconverted USD/EUR/CZK/GBP rows (including `[UNCONVERTED: ...]` rows from failed live lookups) and converts them using **historical daily exchange rates** for each row's exact date via `frankfurter.app`. |
 
 ---
@@ -280,7 +280,7 @@ All pure parsing logic is shared between Google Apps Script and Node.js.
 node tests.js
 ```
 
-`tests.js` loads `parsing.js` and `קוד.js` into Node's `vm` with mocked Apps Script services (`SpreadsheetApp`, `LockService`, `PropertiesService`, `UrlFetchApp`, `Charts`, `ContentService`, `Utilities`) and executes **59 unit and regression tests** covering:
+`tests.js` loads `parsing.js` and `קוד.js` into Node's `vm` with mocked Apps Script services (`SpreadsheetApp`, `LockService`, `PropertiesService`, `UrlFetchApp`, `Charts`, `ContentService`, `Utilities`) and executes **62 unit and regression tests** covering:
 - Ad/promo filtering and safety words
 - Israeli card SMS formats (Isracard, Cal, MAX, Cibus, Google Wallet)
 - Locale number parsing, Unicode direction marks, and currency conversion
@@ -318,7 +318,7 @@ You can also run `runUnitTests()` directly inside the Apps Script editor for a q
 - **Root Cause & Fix:** Isracard SMS messages write `"בכרטיסך"`, whereas Cal writes `"בכרטיס"`.
   - In **MacroDroid**, change your SMS content filter from `"בכרטיסך"` to **`"בכרטיס"`** (substring match captures both!).
   - Make sure SMS transaction alerts are enabled with the new card issuer and that the new card's Android app is checked in your MacroDroid Notification trigger.
-  - Ensure you have pushed the latest [`parsing.js`](parsing.js) (which checks `"בכרטיס"` in `parseMerchant`, `TX_KEYWORDS`, and `TX_SAFETY_WORDS`) and created a **new Web App deployment version**.
+  - Ensure you have pushed the latest [`parsing.js`](parsing.js) (which detects `"בכרטיס"` in `parseMerchant` and checks `בכרטיס <4 digits>` / `בכרטיסך` in `TX_KEYWORDS`) and created a **new Web App deployment version**.
 
 </details>
 
@@ -358,13 +358,15 @@ You can also run `runUnitTests()` directly inside the Apps Script editor for a q
 </details>
 
 <details>
-<summary><strong>5. Promotional / spam SMS messages are logged as transactions, OR legitimate merchants like <code>Costco Wholesale</code> get blocked as ads.</strong></summary>
+<summary><strong>5. Promotional / spam SMS messages are logged as transactions (e.g., 10,000 ₪ credit-card promo), OR legitimate merchants like <code>Costco Wholesale</code> get blocked as ads.</strong></summary>
 
 - **Root Cause:**
-  - Promo SMSes contain numbers and shekel signs (e.g., `"ב-₪599 בלבד במקום ₪1,490"`, `"YUMMI 28.2.26"`).
+  - Promo SMSes contain numbers and shekel signs (e.g., `"ב-₪599 בלבד במקום ₪1,490"`, `"כפוף לרכישות בסך 10,000 ₪"`, `"YUMMI 28.2.26"`).
+  - Credit card marketing SMSes often contain `"בכרטיסי"` (`"רק בכרטיסי אמריקן אקספרס"`), which previously matched `"בכרטיס"` in `TX_SAFETY_WORDS` and bypassed the ad keyword blocklist!
   - Naive substring matching on `"sale"` falsely blocked `"Wholesale"`.
 - **How It Was Fixed:**
-  - **Layer 1 (`findAdReason`):** Hebrew promo keywords (`הנחה`, `מבצע`, `במקום`, `בלבד`, `להסרה`, `מועדון`, etc.) + **word-boundary** English regex (`\b(?:sales?|promo\w*|discounts?)\b` — so `"Wholesale"` is safe), bypassed only if a real transaction safety word (`חוייב`, `אושרה`, `עסקה`, `בכרטיס`, `paid`, etc.) is present.
+  - **Layer 0 (`HARD_AD_PATTERNS`):** Unambiguous unsubscribe footers (`"להסרה מרשימת התפוצה"`, `"יש לשלוח הסר"`) and mandatory loan/credit disclaimers (`"אי־עמידה בפירעון"`, `"לתקנון המבצע"`, `"למצטרפים חדשים"`) are always rejected and **cannot** be bypassed by safety words.
+  - **Layer 1 (`findAdReason`):** Hebrew promo keywords (`הנחה`, `מבצע`, `הטבות`, `תקנון`, `מצטרפים`, `במקום`, `בלבד`, `להסרה`, `מועדון`, etc.) + **word-boundary** English regex (`\b(?:sales?|promo\w*|discounts?)\b` — so `"Wholesale"` is safe). `TX_SAFETY_WORDS` only allows real charge/approval verbs (`חוייב`, `אושרה`, `עסקה`, `שולם`, `paid`, etc. — **never** bare `"בכרטיס"`).
   - **Layer 2:** SMS messages with zero transaction keywords (`TX_KEYWORDS`) are rejected as `Ignored: SMS Ad`.
   - Run **Wallet Tools → Remove SMS Ad Transactions** (`fixAdTransactions`) to clean up past spam rows.
 

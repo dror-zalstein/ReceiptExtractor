@@ -284,6 +284,18 @@ test("Promotional SMS with 'להסרה' opt-out should be rejected as Ad", funct
   eq(send("Castro", "סופר סייל! כל החנות עד 50% הנחה. להסרה השב הסר"), "Ignored: Ad");
   eq(txRows().length, 0, "rows written");
 });
+test("Credit card promo SMS containing 'בכרטיסי' and 'בסך 10,000 ₪' must be rejected as Ad", function () {
+  setupEnv();
+  var flyCardAd = "מצטרפים עכשיו ל-FLY CARD PREMIUM של אמריקן אקספרס, נהנים מפטור מדמי כרטיס ומקבלים כרטיס טיסה מתנה...\nרק בכרטיסי אמריקן אקספרס\nלפרטים המלאים: https://example.com למצטרפים חדשים בהתאם לתקנון המבצע, עד 31.12.26. כפוף לרכישות בסך 10,000 ₪ עד 31.03.27. אי־עמידה בפירעון ההלוואה או האשראי עלולה לגרור ריבית פיגורים.\nלהסרה מרשימת התפוצה ב SMS יש לשלוח הסר למספר 0530000000";
+  eq(send("Amex", flyCardAd), "Ignored: Ad");
+  eq(send("SMS", flyCardAd), "Ignored: Ad");
+  eq(txRows().length, 0, "rows written");
+});
+test("Promo SMS with unsubscribe footer is rejected even if it mentions a transaction safety word", function () {
+  setupEnv();
+  eq(send("PromoCard", "בצע עסקה בסך 500 ₪ וקבל מתנה! להסרה מרשימת התפוצה יש לשלוח הסר"), "Ignored: Ad");
+  eq(txRows().length, 0, "rows written");
+});
 test("MacroDroid temporary receipt notification should be rejected", function () {
   setupEnv();
   eq(send("Preparing your receipt...", "Processing"), "Ignored: Temporary");
@@ -509,6 +521,16 @@ test("#8d fixAdTransactions removes SAUTER promotional row even if merchant is n
     transactions: [
       [hoursAgo(48), "Shufersal", 250, "Groceries", "בכרטיסך אושרה עסקה בסך 250 ש\"ח בשופרסל"],
       [hoursAgo(2), "SAUTER", 599, "Home Improvement", "דאגנו לכם למכונת ברד וגלידה 3 ב-1 של SAUTER ב-₪599 בלבד במקום ₪1,490 ועוד מוצרים מטורפים במחירי מועדון שווים. כנסו להציץ >>"]
+    ]
+  });
+  fixAdTransactions();
+  eq(txRows().map(function (r) { return r[1]; }), ["Shufersal"], "remaining merchants");
+});
+test("#8e fixAdTransactions removes FlyCard 10,000 ILS promo row containing 'בכרטיסי'", function () {
+  setupEnv({
+    transactions: [
+      [hoursAgo(48), "Shufersal", 250, "Groceries", "בכרטיסך אושרה עסקה בסך 250 ש\"ח בשופרסל"],
+      [hoursAgo(2), "Amex", 10000, "Uncategorized", "רק בכרטיסי אמריקן אקספרס. כפוף לרכישות בסך 10,000 ₪. להסרה מרשימת התפוצה ב SMS יש לשלוח הסר"]
     ]
   });
   fixAdTransactions();

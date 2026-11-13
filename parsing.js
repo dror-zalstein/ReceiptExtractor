@@ -15,28 +15,39 @@ var CATEGORIES = ["Groceries", "Restaurants", "Transport", "Bills", "Clothing", 
 
 // Hebrew ad keywords are matched as substrings (Hebrew attaches prefixes like ה/ו/ל to words)
 var AD_KEYWORDS_HE = [
-  "הנחה", "קבלו", "מבצע", "הצטרפו", "קופון", "שובר", "הטבה",
+  "הנחה", "קבלו", "מבצע", "הצטרפו", "מצטרפים", "קופון", "שובר", "הטבה", "הטבות",
   "אל תפספסו", "לא תפספסו", "להזמנה", "לפרטים", "בתוקף עד", "עד גמר המלאי",
   "הירשמו", "חינם", "מתנה", "לרכישה", "לרוכשים", "למזמינים",
   "במקום", "בלבד", "להסרה", "כנסו", "היכנסו", "להציץ", "הציצו",
   "מחירי מועדון", "חברי מועדון", "הצטרפו למועדון", "דאגנו לכם",
-  "מטורף", "שווים", "בלעדי", "סייל", "חיסול"
+  "מטורף", "שווים", "בלעדי", "סייל", "חיסול", "תקנון"
 ];
 
 // English ad keywords: whole words, case-insensitive ("SALE" matches, "Wholesale" doesn't)
 var AD_KEYWORDS_EN = /\b(?:sales?|promo\w*|discounts?)\b|%\s*off\b/i;
 
-// Safety check: an ad keyword is ignored if the text also looks like a real receipt/transaction
+// Hard ad patterns: unambiguous marketing/opt-out footers & credit disclaimers that
+// NEVER appear in real purchase receipts — cannot be bypassed by safety words.
+var HARD_AD_PATTERNS = [
+  /להסרה\s*(?:מרשימת התפוצה|השב\s+הסר|יש\s+לשלוח\s+הסר|שלחו?\s+הסר)/,
+  /יש\s+לשלוח\s+הסר/,
+  /אי[־\-\s]?עמידה\s+בפירעון/,
+  /לתקנון\s+המבצע/,
+  /למצטרפים\s+חדשים/
+];
+
+// Safety check: an ad keyword is ignored if the text also looks like a real receipt/transaction.
+// Must contain an actual charge/approval verb (never bare "בכרטיס", which matches promo "בכרטיסי").
 var TX_SAFETY_WORDS = [
   "shulam", "paid", "Payment", "payment",
   "חוייב", "חויב", "חוייבת", "חויבת", "אושרה", "עסקה",
-  "שולם", "שילמת", "בכרטיס", "הסיבוס שלך"
+  "שולם", "שילמת", "הסיבוס שלך"
 ];
 
 // Real bank/card SMSes ALWAYS contain at least one transaction keyword
 var TX_KEYWORDS = [
   "עסקה", "חוייב", "חויב", "חוייבת", "חויבת", "לחיוב",
-  "בכרטיס", "אושרה", "שולם", "שילמת", "בסך", "על סך", "הסיבוס שלך",
+  "בכרטיסך", "אושרה", "שולם", "שילמת", "בסך", "על סך", "הסיבוס שלך",
   "Total", "Amount", "charged", "paid", "Payment", "payment"
 ];
 
@@ -65,11 +76,19 @@ function containsAny_(text, words) {
 /**
  * Two-layer ad filter. Returns null for a (likely) real transaction, or
  * { response, detail } describing why the text should be rejected.
+ *   Layer 0: Unambiguous marketing opt-out / credit-offer disclaimer (hard block)
  *   Layer 1: Ad keyword blocklist (skipped if a transaction safety word is present)
  *   Layer 2: SMS structural check — an SMS with no transaction keyword is promotional
  */
 function findAdReason(rawText, isSMS) {
   var text = String(rawText);
+
+  // Layer 0: Unambiguous opt-out / legal credit-marketing disclaimers
+  for (var h = 0; h < HARD_AD_PATTERNS.length; h++) {
+    if (HARD_AD_PATTERNS[h].test(text)) {
+      return { response: "Ignored: Ad", detail: "Hard ad pattern matched: " + HARD_AD_PATTERNS[h].source };
+    }
+  }
 
   // Layer 1: Keyword blocklist
   var adHit = null;
@@ -85,7 +104,7 @@ function findAdReason(rawText, isSMS) {
   }
 
   // Layer 2: SMS structural filter
-  if (isSMS && !containsAny_(text, TX_KEYWORDS)) {
+  if (isSMS && !containsAny_(text, TX_KEYWORDS) && !/בכרטיס\s+(?:המסתיים|\d{4})/.test(text)) {
     return { response: "Ignored: SMS Ad", detail: "SMS with no transaction keywords (likely ad/promo)" };
   }
   return null;
