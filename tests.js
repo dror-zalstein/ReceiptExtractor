@@ -56,6 +56,7 @@ FakeSheet.prototype.getRange = function (row, col, numRows, numCols) {
       }
       return out;
     },
+    setValue: function (v) { this.setValues([[v]]); },
     setValues: function (values) {
       for (var r = 0; r < numRows; r++) {
         if (!sheet.rows[row - 1 + r]) sheet.rows[row - 1 + r] = [];
@@ -97,7 +98,12 @@ function fakeFetch(url, options) {
     return jsonResponse(200, { rates: { ILS: RATES[from] } });
   }
   if (url.indexOf("generativelanguage.googleapis.com") > -1) {
-    env.geminiCalls.push({ lockHeld: env.lockHeld, payload: options && options.payload });
+    var callIdx = env.geminiCalls.length;
+    env.geminiCalls.push({ url: url, lockHeld: env.lockHeld, payload: options && options.payload });
+    var status = (env.geminiStatuses && callIdx < env.geminiStatuses.length) ? env.geminiStatuses[callIdx] : 200;
+    if (status !== 200) {
+      return jsonResponse(status, { error: { code: status, message: "Mock Gemini error " + status } });
+    }
     return jsonResponse(200, { candidates: [{ content: { parts: [{ text: env.geminiReply }] } }] });
   }
   if (url.indexOf("api.telegram.org") > -1) {
@@ -134,6 +140,7 @@ function setupEnv(opts) {
     rateFail: !!opts.rateFail,
     rateMissing: !!opts.rateMissing,
     geminiReply: opts.geminiReply === undefined ? "Groceries" : opts.geminiReply,
+    geminiStatuses: opts.geminiStatuses || null,
     geminiCalls: [],
     telegram: [],
     fetches: [],
@@ -958,6 +965,92 @@ test("syncAndDeduplicateCategories removes newer duplicates and syncs missing me
   eq(catData[3][1], "Groceries");
   eq(catData[4][0], "קיי.אס.פי מחשבים רמת");
   eq(catData[4][1], "Electronics");
+});
+
+// ---------------------------------------------------------------------
+section("21. Keyword fallback, grounded parsing & Categories row upgrade");
+
+test("Isracard 'שווארמה הסולטן' SMS parses cleanly, classifies as Restaurants, and caches in Categories", function () {
+  var sms = "שלום,\nבכרטיסך המסתיים ב- 1234, אושרה עסקה ב-26/11 בסך 77.00 ש\"ח בשווארמה הסולטן.\n" +
+    "למידע נוסף באפליקציה ובאתר: https://isracard.onelink.me/bajD/example1.\nלשירותך, ישראכרט";
+  setupEnv({ geminiReply: "Restaurants" });
+  eq(send("Isracard", sms), "Success");
+  eq(lastTx().merchant, "שווארמה הסולטן");
+  eq(lastTx().amount, 77);
+  eq(lastTx().category, "Restaurants");
+  var cats = env.ss.sheets.Categories.rows.slice(1);
+  eq(cats.length, 1);
+  eq(cats[0][0], "שווארמה הסולטן");
+  eq(cats[0][1], "Restaurants");
+});
+test("Keyword fallback classifies 'שווארמה הסולטן' as Restaurants and caches when Gemini fails or returns Uncategorized", function () {
+  var sms = "שלום,\nבכרטיסך המסתיים ב- 1234, אושרה עסקה ב-26/11 בסך 77.00 ש\"ח בשווארמה הסולטן.\n" +
+    "למידע נוסף באפליקציה ובאתר: https://isracard.onelink.me/bajD/example1.\nלשירותך, ישראכרט";
+  setupEnv({ geminiReply: "Uncategorized" });
+  eq(send("Isracard", sms), "Success");
+  eq(lastTx().merchant, "שווארמה הסולטן");
+  eq(lastTx().category, "Restaurants");
+  var cats = env.ss.sheets.Categories.rows.slice(1);
+  eq(cats, [["שווארמה הסולטן", "Restaurants"]]);
+
+  setupEnv({
+    transactions: [[hoursAgo(2), "שווארמה הסולטן", 77, "Uncategorized", sms]],
+    scriptProperties: { GEMINI_API_KEY: "" }
+  });
+  reprocessCategories();
+  eq(txRows()[0][3], "Restaurants");
+  eq(env.ss.sheets.Categories.rows.slice(1), [["שווארמה הסולטן", "Restaurants"]]);
+});
+test("Existing blank or Uncategorized row in Categories does not block categorization and is upgraded in-place", function () {
+  var sms = "שלום,\nבכרטיסך המסתיים ב- 1234, אושרה עסקה ב-26/11 בסך 77.00 ש\"ח בשווארמה הסולטן.\nלשירותך, ישראכרט";
+  setupEnv({
+    categories: [["שווארמה הסולטן", "Uncategorized"], ["פלאפל בר", ""]],
+    transactions: [[hoursAgo(2), "פלאפל בר", 35, "Uncategorized", "..."]],
+    geminiReply: "Uncategorized"
+  });
+  eq(send("Isracard", sms), "Success");
+  eq(lastTx().category, "Restaurants");
+
+  reprocessCategories();
+  eq(txRows()[0][3], "Restaurants");
+  var cats = env.ss.sheets.Categories.rows.slice(1);
+  eq(cats.length, 2, "must update existing rows in-place without duplicates");
+  eq(cats[0], ["שווארמה הסולטן", "Restaurants"]);
+  eq(cats[1], ["פלאפל בר", "Restaurants"]);
+});
+test("syncAndDeduplicateCategories upgrades blank/Uncategorized cache entries from Transactions or keyword fallback", function () {
+  setupEnv({
+    categories: [["שווארמה הסולטן", ""], ["חנות אקראית", "Uncategorized"]],
+    transactions: [
+      [hoursAgo(2), "חנות אקראית", 50, "Clothing", "..."],
+      [hoursAgo(1), "שווארמה הסולטן", 77, "Uncategorized", "..."]
+    ],
+    geminiReply: "Uncategorized"
+  });
+  syncAndDeduplicateCategories();
+  var cats = env.ss.sheets.Categories.rows.slice(1);
+  eq(cats.length, 2);
+  eq(cats[0], ["שווארמה הסולטן", "Restaurants"]);
+  eq(cats[1], ["חנות אקראית", "Clothing"]);
+});
+test("normalizeCategory handles markdown bullets and single-line grounded conclusions without accepting Food", function () {
+  eq(normalizeCategory("- **Restaurants**"), "Restaurants");
+  eq(normalizeCategory("שווארמה הסולטן is a shawarma restaurant -> Restaurants [1]."), "Restaurants");
+  eq(normalizeCategory("שווארמה הסולטן: Restaurants"), "Restaurants");
+  eq(normalizeCategory("Food"), "Uncategorized");
+});
+test("getGeminiCategory trims quoted API key and falls back to gemini-2.5-flash-lite on 429/503", function () {
+  setupEnv({
+    geminiReply: "Restaurants",
+    geminiStatuses: [429, 503, 200],
+    scriptProperties: { GEMINI_API_KEY: '  "MY_TEST_KEY"  ' }
+  });
+  eq(getGeminiCategory("Unknown Cafe"), "Restaurants");
+  eq(env.geminiCalls.length, 3);
+  ok(env.geminiCalls[0].url.indexOf("key=MY_TEST_KEY") > -1, "API key should be trimmed and unquoted");
+  ok(env.geminiCalls[0].url.indexOf("gemini-2.5-flash:") > -1 && JSON.parse(env.geminiCalls[0].payload).tools !== undefined);
+  ok(env.geminiCalls[1].url.indexOf("gemini-2.5-flash:") > -1 && JSON.parse(env.geminiCalls[1].payload).tools === undefined);
+  ok(env.geminiCalls[2].url.indexOf("gemini-2.5-flash-lite:") > -1 && JSON.parse(env.geminiCalls[2].payload).tools === undefined);
 });
 
 // =====================================================================

@@ -37,7 +37,7 @@ flowchart TD
 | [`קוד.js`](קוד.js) | Apps Script entry points (`doGet`, `onOpen`, `checkAndNotify`), `LockService` deduplication, Gemini API call, currency conversion, and `Wallet Tools` repair utilities. *(Named in Hebrew to match the bound Apps Script project file.)* |
 | [`parsing.js`](parsing.js) | Pure parsing and validation helpers (`findAdReason`, `parseMerchant`, `extractAmount`, `parseLocaleNumber`, `isMerchantMatch`, `normalizeCategory`, `CATEGORIES`). Contains zero Apps Script calls so it runs identically in Node and Apps Script. |
 | [`appsscript.json`](appsscript.json) | Apps Script manifest (`Asia/Jerusalem` timezone, V8 runtime, Web App `USER_DEPLOYING` + `ANYONE_ANONYMOUS`). |
-| [`tests.js`](tests.js) | Local Node.js test suite (80 tests) that loads `parsing.js` and `קוד.js` into a mocked Apps Script `vm` context. Excluded from `clasp push` via `.claspignore`. |
+| [`tests.js`](tests.js) | Local Node.js test suite (86 tests) that loads `parsing.js` and `קוד.js` into a mocked Apps Script `vm` context. Excluded from `clasp push` via `.claspignore`. |
 | [`.clasp.json.example`](.clasp.json.example) | Template for binding [`clasp`](https://github.com/google/clasp) to your own Apps Script project. Real `.clasp.json` is gitignored. |
 | [`.claspignore`](.claspignore) | Ensures only `appsscript.json`, `parsing.js`, and `קוד.js` are pushed to Apps Script. |
 | [`CONTEXT.md`](CONTEXT.md) | Architectural invariants and "do not touch" safeguards for contributors. |
@@ -82,7 +82,7 @@ Row 1 headers (**Columns A–B**):
 | **A** | `Merchant` | Cached merchant name (normalized at lookup time for quotes, dots, hyphens, branch suffixes, and 1–2 char terminal truncation). |
 | **B** | `Category` | Target category name. |
 
-- Whenever Gemini classifies a new merchant, `doGet` appends `[merchant, category]` here so future purchases at the same merchant skip the AI call.
+- Whenever Gemini (or the deterministic keyword fallback for unmistakable Hebrew/English business-type names like `שווארמה`, `פלאפל`, `סופר-פארם`) classifies a new merchant, `doGet` appends `[merchant, category]` here (and `addToMerchantCache` upgrades any existing blank/`Uncategorized` row in-place) so future purchases skip the AI call.
 - If a merchant is ever misclassified, **update both `Transactions` and `Categories`**, otherwise future transactions will keep using the cached category.
 
 ### 3. `Dashboard` tab (Used for Daily Telegram Reports)
@@ -279,7 +279,7 @@ All pure parsing logic is shared between Google Apps Script and Node.js.
 node tests.js
 ```
 
-`tests.js` loads `parsing.js` and `קוד.js` into Node's `vm` with mocked Apps Script services (`SpreadsheetApp`, `LockService`, `PropertiesService`, `UrlFetchApp`, `Charts`, `ContentService`, `Utilities`) and executes **80 unit and regression tests** covering:
+`tests.js` loads `parsing.js` and `קוד.js` into Node's `vm` with mocked Apps Script services (`SpreadsheetApp`, `LockService`, `PropertiesService`, `UrlFetchApp`, `Charts`, `ContentService`, `Utilities`) and executes **86 unit and regression tests** covering:
 - Ad/promo filtering and safety words
 - Israeli card SMS formats (Isracard, Cal, MAX, Cibus, Google Wallet)
 - Locale number parsing, Unicode direction marks, and currency conversion

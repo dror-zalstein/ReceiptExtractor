@@ -70,26 +70,33 @@ function doGet(e) {
 
   // A. Manual Lookup (Cache First)
   // We check if we already know this merchant to save AI tokens and time.
-  if (category === "Uncategorized" && catSheet && catSheet.getLastRow() > 1) {
+  if (!isResolvedCategory(category) && catSheet && catSheet.getLastRow() > 1) {
     var catData = catSheet.getRange(2, 1, catSheet.getLastRow() - 1, 2).getValues();
 
     for (var c = 0; c < catData.length; c++) {
-      if (isMerchantMatch(merchant, catData[c][0])) {
-        category = catData[c][1];
+      if (isMerchantMatch(merchant, catData[c][0]) && isResolvedCategory(catData[c][1])) {
+        category = String(catData[c][1]).trim();
         console.log("✅ Found in Cache: " + category);
         break;
       }
     }
   }
 
-  // B. AI Lookup (If still unknown). Generic names ("SMS", phone numbers) are
-  // never sent to the AI or cached — a cached "SMS" would match every unparsed SMS.
-  if (category === "Uncategorized" && !isGenericMerchant(merchant)) {
+  // B. AI Lookup + Keyword Fallback (If still unknown). Generic names ("SMS", phone numbers)
+  // are never sent to the AI or cached — a cached "SMS" would match every unparsed SMS.
+  if (!isResolvedCategory(category) && !isGenericMerchant(merchant)) {
     console.log("🤔 Unknown merchant. Asking Gemini...");
     var aiCategory = getGeminiCategory(merchant);
-    if (aiCategory !== "Uncategorized") {
+    if (isResolvedCategory(aiCategory)) {
       category = aiCategory;
       shouldCache = true;
+    } else {
+      var kwCategory = inferCategoryFromKeywords(merchant);
+      if (isResolvedCategory(kwCategory)) {
+        category = kwCategory;
+        shouldCache = true;
+        console.log("✅ Classified via keyword fallback: " + category);
+      }
     }
   }
 
@@ -155,7 +162,7 @@ function doGet(e) {
     savedRow = sheet.getLastRow();
 
     // Add to cache so next time we skip the AI
-    if (shouldCache) addToMerchantCache(merchant, category);
+    if (shouldCache && isResolvedCategory(category)) addToMerchantCache(merchant, category);
   } finally {
     lock.releaseLock(); // Always release, even if a sheet call throws
   }
@@ -224,41 +231,45 @@ function reprocessCategories() {
 
       // 1. FAST: Check Cache First
       for (var j = 0; j < catData.length; j++) {
-        if (isMerchantMatch(merchant, catData[j][0])) {
-          newCategory = catData[j][1];
+        if (isMerchantMatch(merchant, catData[j][0]) && isResolvedCategory(catData[j][1])) {
+          newCategory = String(catData[j][1]).trim();
           break;
         }
       }
 
-      // 2. SLOW: Ask AI (Only if Cache failed)
-      if (newCategory === "Uncategorized") {
-        if (aiCallsCount >= MAX_AI_CALLS) {
-          remainingUncat++;
-          continue; // Keep scanning older rows for free cache matches
+      // 2. SLOW: Ask AI (Only if Cache failed) + Deterministic Keyword Fallback
+      if (!isResolvedCategory(newCategory)) {
+        if (aiCallsCount < MAX_AI_CALLS) {
+          try {
+            newCategory = getGeminiCategory(merchant);
+            aiCallsCount++;
+
+            // Sleep 4s to stay safe (Free Tier = 15 req/min)
+            Utilities.sleep(4000);
+          } catch (e) {
+            console.log("AI Failed for " + merchant + ": " + e.toString());
+          }
         }
 
-        try {
-          newCategory = getGeminiCategory(merchant);
-          aiCallsCount++;
-
-          // Sleep 4s to stay safe (Free Tier = 15 req/min)
-          Utilities.sleep(4000);
-
-          if (newCategory !== "Uncategorized") {
-            addToMerchantCache(merchant, newCategory);
-            // Add to local memory so next row uses it instantly
-            catData.push([merchant, newCategory]);
-          } else {
-            remainingUncat++;
+        if (!isResolvedCategory(newCategory)) {
+          var kwCat = inferCategoryFromKeywords(merchant);
+          if (isResolvedCategory(kwCat)) {
+            newCategory = kwCat;
+            console.log("Classified via keyword fallback: " + merchant + " -> " + newCategory);
           }
-        } catch (e) {
-          console.log("AI Failed for " + merchant + ": " + e.toString());
+        }
+
+        if (isResolvedCategory(newCategory)) {
+          addToMerchantCache(merchant, newCategory);
+          // Add to local memory so next row uses it instantly
+          catData.push([merchant, newCategory]);
+        } else {
           remainingUncat++;
         }
       }
 
       // 3. Update data array if we found something
-      if (newCategory !== "Uncategorized") {
+      if (isResolvedCategory(newCategory)) {
         data[i][2] = newCategory;
         updatesCount++;
       }
@@ -395,9 +406,9 @@ function fixMisparsedMerchants() {
       // Check if we can match/fix the category from cache; otherwise clear stale category from generic guess
       var matchedCat = false;
       for (var c = 0; c < catData.length; c++) {
-        if (isMerchantMatch(newMerchant, catData[c][0])) {
-          data[i][3] = catData[c][1];
-          console.log("  -> Updated category to: " + catData[c][1]);
+        if (isMerchantMatch(newMerchant, catData[c][0]) && isResolvedCategory(catData[c][1])) {
+          data[i][3] = String(catData[c][1]).trim();
+          console.log("  -> Updated category to: " + data[i][3]);
           matchedCat = true;
           break;
         }
@@ -458,17 +469,24 @@ function syncAndDeduplicateCategories() {
 
     for (var i = 0; i < catData.length; i++) {
       var mName = catData[i][0];
+      var mCat = String(catData[i][1] || "").trim();
       var clean = normalizeMerchant(mName);
       if (!clean) continue;
 
       var sheetRowNum = i + 2; // header is row 1
 
       if (seenMerchants[clean]) {
+        var keptInfo = seenMerchants[clean];
+        // Rescue a valid category from a newer duplicate when the kept older row was blank/Uncategorized
+        if (!isResolvedCategory(cleanCatList[keptInfo.listIdx][1]) && isResolvedCategory(mCat)) {
+          catSheet.getRange(keptInfo.rowNum, 2, 1, 1).setValues([[mCat]]);
+          cleanCatList[keptInfo.listIdx][1] = mCat;
+        }
         rowsToDelete.push(sheetRowNum);
         console.log("Found duplicate category at row " + sheetRowNum + ": '" + mName + "'");
       } else {
-        seenMerchants[clean] = true;
-        cleanCatList.push([mName, catData[i][1]]);
+        seenMerchants[clean] = { listIdx: cleanCatList.length, rowNum: sheetRowNum };
+        cleanCatList.push([mName, mCat]);
       }
     }
 
@@ -484,6 +502,7 @@ function syncAndDeduplicateCategories() {
 
   // --- PART 2: Sync missing merchants from Transactions to Categories ---
   var addedCount = 0;
+  var updatedCount = 0;
   var aiCallsCount = 0;
 
   if (txSheet && txSheet.getLastRow() > 1) {
@@ -499,25 +518,31 @@ function syncAndDeduplicateCategories() {
       if (!txMerchant || isGenericMerchant(txMerchant)) continue;
 
       // Check if this merchant already matches any entry in cleanCatList
-      var exists = false;
+      var matchedIndex = -1;
       for (var c = 0; c < cleanCatList.length; c++) {
         if (isMerchantMatch(txMerchant, cleanCatList[c][0])) {
-          exists = true;
+          matchedIndex = c;
           break;
         }
       }
 
-      if (!exists) {
-        var finalCat = (txCat && txCat !== "Uncategorized") ? txCat : "Uncategorized";
+      if (matchedIndex === -1) {
+        var finalCat = isResolvedCategory(txCat) ? txCat : "Uncategorized";
 
-        // If transaction has no category, try Gemini (up to 5 calls safety limit)
-        if (finalCat === "Uncategorized" && aiCallsCount < 5) {
-          try {
-            var aiCat = getGeminiCategory(txMerchant);
-            aiCallsCount++;
-            if (aiCat !== "Uncategorized") finalCat = aiCat;
-          } catch (e) {
-            console.log("AI error: " + e.toString());
+        // If transaction has no category, try Gemini (up to 5 calls safety limit), then keyword fallback
+        if (finalCat === "Uncategorized") {
+          if (aiCallsCount < 5) {
+            try {
+              var aiCat = getGeminiCategory(txMerchant);
+              aiCallsCount++;
+              if (isResolvedCategory(aiCat)) finalCat = aiCat;
+            } catch (e) {
+              console.log("AI error: " + e.toString());
+            }
+          }
+          if (finalCat === "Uncategorized") {
+            var kwSync = inferCategoryFromKeywords(txMerchant);
+            if (isResolvedCategory(kwSync)) finalCat = kwSync;
           }
         }
 
@@ -525,17 +550,42 @@ function syncAndDeduplicateCategories() {
         cleanCatList.push([txMerchant, finalCat]); // Update in-memory so future rows don't re-add
         addedCount++;
         console.log("Added missing merchant to Categories: '" + txMerchant + "' -> '" + finalCat + "'");
+      } else if (!isResolvedCategory(cleanCatList[matchedIndex][1])) {
+        // Existing cache row is blank or Uncategorized — upgrade it if we can resolve a category
+        var resolvedCat = isResolvedCategory(txCat) ? txCat : "Uncategorized";
+        if (resolvedCat === "Uncategorized" && aiCallsCount < 5) {
+          try {
+            var aiUpgrade = getGeminiCategory(txMerchant);
+            aiCallsCount++;
+            if (isResolvedCategory(aiUpgrade)) resolvedCat = aiUpgrade;
+          } catch (e) {
+            console.log("AI error: " + e.toString());
+          }
+        }
+        if (resolvedCat === "Uncategorized") {
+          var kwUpgrade = inferCategoryFromKeywords(txMerchant);
+          if (isResolvedCategory(kwUpgrade)) resolvedCat = kwUpgrade;
+        }
+        if (isResolvedCategory(resolvedCat)) {
+          addToMerchantCache(cleanCatList[matchedIndex][0], resolvedCat);
+          cleanCatList[matchedIndex][1] = resolvedCat;
+          updatedCount++;
+          console.log("Updated blank/Uncategorized merchant in Categories: '" + cleanCatList[matchedIndex][0] + "' -> '" + resolvedCat + "'");
+        }
       }
     }
   }
 
-  if (dupesRemoved > 0 || addedCount > 0) {
+  if (dupesRemoved > 0 || addedCount > 0 || updatedCount > 0) {
     SpreadsheetApp.flush();
   }
 
   var msg = "Categories Sync Complete!\n\n" +
     "• Duplicate categories removed: " + dupesRemoved + "\n" +
     "• Missing merchants added from Transactions: " + addedCount;
+  if (updatedCount > 0) {
+    msg += "\n• Blank/Uncategorized entries updated: " + updatedCount;
+  }
   SpreadsheetApp.getUi().alert(msg);
 }
 
@@ -1039,17 +1089,12 @@ function checkAndNotify() {
 }
 
 function getGeminiCategory(merchantName) {
-  var apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  var rawKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  var apiKey = rawKey ? String(rawKey).replace(/^["'\s]+|["'\s]+$/g, "") : "";
   if (!apiKey) {
     console.log("❌ Missing GEMINI_API_KEY in Script Properties");
     return "Uncategorized";
   }
-
-  // OPTION 1: Try the "Latest" alias (often fixes the 404)
-  var modelName = "gemini-2.5-flash";
-  // var modelName = "gemini-pro"; // Fallback if flash fails
-
-  var url = "https://generativelanguage.googleapis.com/v1beta/models/" + modelName + ":generateContent?key=" + apiKey;
 
   var myCategories = CATEGORIES.join(", ");
 
@@ -1058,9 +1103,9 @@ function getGeminiCategory(merchantName) {
     "Into ONE of these categories: [" + myCategories + ", Uncategorized].\n" +
     "Instructions:\n" +
     "1. Use Google Search to look up the merchant name (search both the exact name and its Hebrew transliteration / Israeli business name, e.g. 'KOKPIT 67' -> 'קוקפיט 67') to verify what type of business it actually is.\n" +
-    "2. Do NOT guess based on the literal meaning of words in the business name (for example, 'KOKPIT 67' is a cocktail bar/pub in Givatayim, NOT aviation/Transport).\n" +
+    "2. Do NOT misclassify figurative or brand-style names literally (for example, 'KOKPIT 67' is a cocktail bar/pub in Givatayim, NOT aviation/Transport). However, when the merchant name explicitly contains an unmistakable business-type word (such as 'שווארמה', 'פלאפל', 'שיפודי', 'פיצה', 'מאפייה', 'בייקרי', 'מסעדה', 'סופרמרקט', 'בית מרקחת', 'Shawarma', 'Falafel', 'Pizza', 'Bakery', 'Restaurant', 'Supermarket', 'Pharmacy'), DO classify it by that business type even if Google Search finds multiple branches or no website.\n" +
     "3. Category rules:\n" +
-    "- Restaurants, cafes, bars, pubs, cocktail bars, nightlife, wineries, bakeries, ice cream shops, fast food, food delivery ('Shipudei', 'Falafel', 'Shawarma', 'Cafe', 'Bar', 'Pub', 'Kokpit 67') -> 'Restaurants'\n" +
+    "- Restaurants, cafes, bars, pubs, cocktail bars, nightlife, wineries, bakeries, ice cream shops, fast food, food delivery ('שווארמה', 'פלאפל', 'שיפודי', 'פיצה', 'בורגר', 'סושי', 'חומוס', 'קפה', 'מאפייה', 'בייקרי', 'גלידה', 'מסעדה', 'Shipudei', 'Falafel', 'Shawarma', 'Cafe', 'Bar', 'Pub', 'Kokpit 67') -> 'Restaurants'\n" +
     "- Supermarkets, mini-markets, grocery stores, butchers, greengrocers ('Super', 'Shufersal', 'Market', 'AM:PM') -> 'Groceries'\n" +
     "- Pharmacies, drugstores, clinics, doctors, dentists ('Pharm', 'Drugstore', 'Super-Pharm', 'Be', 'Dental', 'Medical', 'Clinic') -> 'Health'\n" +
     "- Travel agencies, flights, airlines, hotels, resorts, vacation packages, travel booking sites ('Holidays Lines', 'Holiday Lines', 'קווי חופשה', 'Issta', 'El Al', 'Arkia', 'Booking.com', 'Airbnb') -> 'Vacation'\n" +
@@ -1068,73 +1113,73 @@ function getGeminiCategory(merchantName) {
     "- ATM / cash withdrawals ('ATM', 'Euronet', 'Cash Withdrawal') -> 'Cash Withdraw'\n" +
     "- 'Ikea', furniture, hardware, home goods -> 'Home Improvement'\n" +
     "- 'Bit', 'Paybox' -> 'Uncategorized' (unless context implies otherwise)\n" +
-    "- If the merchant cannot be identified with confidence even after searching, return 'Uncategorized'.\n" +
+    "- If the merchant cannot be identified with confidence even after searching and has no clear business-type keyword, return 'Uncategorized'.\n" +
     "- Return ONLY the exact category name (no explanation, no JSON, no punctuation).";
 
-  var payload = {
-    "contents": [{
-      "parts": [{ "text": promptText }]
-    }],
-    "tools": [{
-      "google_search": {}
-    }],
-    "generationConfig": { "temperature": 0 }
-  };
+  var attempts = [
+    { model: "gemini-2.5-flash", useSearch: true },
+    { model: "gemini-2.5-flash", useSearch: false },
+    { model: "gemini-2.5-flash-lite", useSearch: false }
+  ];
 
-  var options = {
-    "method": "post",
-    "contentType": "application/json",
-    "payload": JSON.stringify(payload),
-    "muteHttpExceptions": true
-  };
-
-  try {
-    var response = UrlFetchApp.fetch(url, options);
-    var responseCode = response.getResponseCode();
-    var responseText = response.getContentText();
-
-    // Fallback without google_search tool if search grounding fails (e.g. tool quota error)
-    if (responseCode !== 200) {
-      console.log("⚠️ AI Search Grounding Error (" + responseCode + "), retrying without search tool...");
-      delete payload.tools;
-      options.payload = JSON.stringify(payload);
-      response = UrlFetchApp.fetch(url, options);
-      responseCode = response.getResponseCode();
-      responseText = response.getContentText();
+  for (var a = 0; a < attempts.length; a++) {
+    var attempt = attempts[a];
+    var url = "https://generativelanguage.googleapis.com/v1beta/models/" + attempt.model + ":generateContent?key=" + encodeURIComponent(apiKey);
+    var payload = {
+      "contents": [{
+        "parts": [{ "text": promptText }]
+      }],
+      "generationConfig": { "temperature": 0 }
+    };
+    if (attempt.useSearch) {
+      payload.tools = [{ "google_search": {} }];
     }
 
-    // Debug: Print error if API fails
-    if (responseCode !== 200) {
-      console.log("❌ AI API Error (" + responseCode + "): " + responseText);
-      return "Uncategorized";
-    }
+    var options = {
+      "method": "post",
+      "contentType": "application/json",
+      "payload": JSON.stringify(payload),
+      "muteHttpExceptions": true
+    };
 
-    var json = JSON.parse(responseText);
-    if (json.candidates && json.candidates.length > 0 && json.candidates[0].content) {
-      var parts = json.candidates[0].content.parts || [];
-      var answer = parts
-        .filter(function (p) { return !p.thought && typeof p.text === "string"; })
-        .map(function (p) { return p.text; })
-        .join("\n");
-      // Only accept answers from CATEGORIES (case/punctuation tolerant)
-      var category = normalizeCategory(answer);
-      if (category === "Uncategorized") console.log("⚠️ AI answer not in category list: " + answer);
-      return category;
+    try {
+      var response = UrlFetchApp.fetch(url, options);
+      var responseCode = response.getResponseCode();
+      var responseText = response.getContentText();
+
+      if (responseCode !== 200) {
+        console.log("⚠️ AI Error (" + attempt.model + (attempt.useSearch ? "+search" : "") + ", HTTP " + responseCode + "): " + responseText);
+        continue;
+      }
+
+      var json = JSON.parse(responseText);
+      if (json.candidates && json.candidates.length > 0 && json.candidates[0].content) {
+        var parts = json.candidates[0].content.parts || [];
+        var answer = parts
+          .filter(function (p) { return !p.thought && typeof p.text === "string"; })
+          .map(function (p) { return p.text; })
+          .join("\n");
+        // Only accept answers from CATEGORIES (case/punctuation tolerant)
+        var category = normalizeCategory(answer);
+        if (category === "Uncategorized") console.log("⚠️ AI answer not in category list: " + answer);
+        return category;
+      }
+    } catch (e) {
+      console.log("❌ Script Error (" + attempt.model + "): " + e.toString());
     }
-  } catch (e) {
-    console.log("❌ Script Error: " + e.toString());
   }
 
   return "Uncategorized";
 }
 
 function listMyModels() {
-  var apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  var rawKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  var apiKey = rawKey ? String(rawKey).replace(/^["'\s]+|["'\s]+$/g, "") : "";
   if (!apiKey) {
     console.log("❌ Missing GEMINI_API_KEY in Script Properties");
     return;
   }
-  var url = "https://generativelanguage.googleapis.com/v1beta/models?key=" + apiKey;
+  var url = "https://generativelanguage.googleapis.com/v1beta/models?key=" + encodeURIComponent(apiKey);
 
   try {
     var response = UrlFetchApp.fetch(url);
@@ -1150,25 +1195,32 @@ function listMyModels() {
 }
 
 /**
- * Adds a new merchant and category to the 'Categories' sheet (Col A & B).
- * Prevents duplicates to keep the sheet clean.
+ * Adds a new merchant and category to the 'Categories' sheet (Col A & B),
+ * skipping duplicates with resolved categories and upgrading blank/Uncategorized rows in-place.
  */
 function addToMerchantCache(merchantName, category) {
+  if (!merchantName || isGenericMerchant(merchantName) || !isResolvedCategory(category)) return;
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var catSheet = ss.getSheetByName("Categories"); // Or "Merchant Map" if you use that
 
   if (!catSheet) return;
 
-  // 1. Check for duplicates (Don't add "McDonalds" twice)
+  // 1. Check existing rows: skip resolved duplicates, or fill blank/Uncategorized Col B in-place
   var lastRow = catSheet.getLastRow();
   if (lastRow > 1) {
-    var data = catSheet.getRange(2, 1, lastRow - 1, 1).getValues(); // Get all existing names
+    var data = catSheet.getRange(2, 1, lastRow - 1, 2).getValues();
     var cleanNew = normalizeMerchant(merchantName);
 
     for (var i = 0; i < data.length; i++) {
       var cleanExisting = normalizeMerchant(data[i][0]);
-      if (cleanExisting === cleanNew) {
-        console.log("Cache: Merchant '" + merchantName + "' already exists.");
+      if (cleanExisting === cleanNew || isMerchantMatch(merchantName, data[i][0])) {
+        if (!isResolvedCategory(data[i][1])) {
+          catSheet.getRange(i + 2, 2, 1, 1).setValues([[category]]);
+          SpreadsheetApp.flush();
+          console.log("Cache: Updated '" + data[i][0] + "' -> '" + category + "'");
+        } else {
+          console.log("Cache: Merchant '" + merchantName + "' already exists.");
+        }
         return;
       }
     }

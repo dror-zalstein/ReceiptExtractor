@@ -412,13 +412,22 @@ var CATEGORY_ALIASES = {
   "atm": "Cash Withdraw"
 };
 
+/**
+ * True when a sheet/cache category cell holds an actual resolved category
+ * (not blank and not "Uncategorized"). Allows user-defined custom categories.
+ */
+function isResolvedCategory(cat) {
+  var c = String(cat || "").trim();
+  return c !== "" && c.toLowerCase() !== "uncategorized";
+}
+
 function matchSingleCategory_(line) {
   var t = String(line || "")
     .replace(/\[\d+(?:\s*,\s*\d+)*\]/g, "") // Strip Google Search citation markers like [1]
-    .replace(/["'`{}*]/g, "")
-    .replace(/^\s*category\s*:\s*/i, "")
-    .replace(/[.,!;:\s]+$/, "")
-    .trim()
+    .replace(/["'`{}*_~]/g, "")
+    .replace(/^[\s\-–—•>]+/, "")
+    .replace(/^(?:final\s+)?(?:category|answer|classification|result)\s*[:\-–—>→]+\s*/i, "")
+    .replace(/^[\s\-–—•>]+|[.,!;:\s]+$/g, "")
     .toLowerCase();
   for (var i = 0; i < CATEGORIES.length; i++) {
     if (CATEGORIES[i].toLowerCase() === t) return CATEGORIES[i];
@@ -429,7 +438,8 @@ function matchSingleCategory_(line) {
 
 /**
  * Maps a free-text AI answer onto one of CATEGORIES (case-insensitive,
- * tolerating quotes / JSON / trailing punctuation / search citations / singular forms).
+ * tolerating quotes / JSON / markdown bullets / trailing punctuation /
+ * search citations / singular forms / grounded conclusion lines).
  * Anything else → "Uncategorized".
  */
 function normalizeCategory(text) {
@@ -437,11 +447,78 @@ function normalizeCategory(text) {
   var direct = matchSingleCategory_(raw);
   if (direct) return direct;
 
-  // If Google Search grounding returned multiple lines, check the last non-empty line
+  // Check lines bottom-up for standalone category lines or explicit grounded conclusions
   var lines = raw.split(/\r?\n/).map(function (l) { return l.trim(); }).filter(Boolean);
-  if (lines.length > 1) {
-    var lastLineMatch = matchSingleCategory_(lines[lines.length - 1]);
-    if (lastLineMatch) return lastLineMatch;
+  for (var i = lines.length - 1; i >= 0; i--) {
+    var lineMatch = matchSingleCategory_(lines[i]);
+    if (lineMatch) return lineMatch;
+    var tailMatch = /(?:->|→|=>|\bis\s+classified\s+as\b|\bcategory\s+is\b|\bbelongs\s+to\b|:)\s*([^:→>\-]+)$/i.exec(lines[i]);
+    if (tailMatch) {
+      var extracted = matchSingleCategory_(tailMatch[1]);
+      if (extracted) return extracted;
+    }
+  }
+  return "Uncategorized";
+}
+
+var KEYWORD_CATEGORY_RULES = [
+  {
+    category: "Restaurants",
+    hebrew: ["שווארמה", "שוורמה", "פלאפל", "שיפודי", "שיפודיה", "פיצה", "פיצריה", "בורגר",
+      "המבורגר", "סושי", "חומוס", "שניצל", "מסעדת", "מסעדה", "בית קפה", "בייקרי",
+      "מאפיית", "מאפייה", "קונדיטוריה", "גלידה", "גלידריה", "גולדה"],
+    english: /\b(?:shawarma|falafel|pizza|pizzeria|burger|burgers|sushi|hummus|bakery|cafe|coffee|gelato|restaurant|bistro|wolt|golda)\b/i
+  },
+  {
+    category: "Groceries",
+    hebrew: ["שופרסל", "רמי לוי", "יוחננוף", "ויקטורי", "חצי חינם", "טיב טעם", "אושר עד",
+      "יינות ביתן", "קרפור", "סופרמרקט", "מינימרקט", "אי.אם.פי.אם", "איי.אם.פי.אם"],
+    english: /\b(?:shufersal|supermarket|minimarket|carrefour)\b|\bam\s*:\s*pm\b/i
+  },
+  {
+    category: "Health",
+    hebrew: ["סופר פארם", "דראגסטורס", "בית מרקחת", "מרפאת", "קופת חולים",
+      "מכבי שירותי", "שירותי בריאות כללית"],
+    english: /\bsuper[\s\-]*pharm\b|\bpharmacy\b|\bdrugstore\b/i
+  },
+  {
+    category: "Vacation",
+    hebrew: ["קווי חופשה", "אל על", "ישראייר", "ארקיע", "איסתא", "בוקינג"],
+    english: /\bholidays?\s+lines\b|\bbooking\.com\b|\bairbnb\b|\bissta\b|\bel[\s\-]*al\b|\barkia\b|\bisrair\b/i
+  },
+  {
+    category: "Transport",
+    hebrew: ["פנגו", "סלופארק", "רב קו", "רכבת ישראל", "כביש 6", "דלק מנטה", "פז ילו", "סונול"],
+    english: /\bpango\b|\bcello\b|\bcellopark\b|\brav[\s\-]*kav\b|\bgett\b|\buber\b/i
+  },
+  {
+    category: "Home Improvement",
+    hebrew: ["איקאה", "הום סנטר"],
+    english: /\bikea\b|\bhome\s+center\b/i
+  }
+];
+
+/**
+ * Deterministic keyword fallback used ONLY after Categories cache and Gemini AI
+ * return "Uncategorized", ensuring unmistakable merchant names like "שווארמה הסולטן"
+ * still resolve cleanly even during AI outages or ambiguous search grounding.
+ */
+function inferCategoryFromKeywords(merchantName) {
+  if (!merchantName || isGenericMerchant(merchantName)) return "Uncategorized";
+  var clean = String(merchantName)
+    .replace(/[\u200B-\u200F\u202A-\u202E\u061C]/g, " ")
+    .replace(/['"`´״׳“”‘’]+/g, "")
+    .replace(/[\-–—_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) return "Uncategorized";
+
+  for (var i = 0; i < KEYWORD_CATEGORY_RULES.length; i++) {
+    var rule = KEYWORD_CATEGORY_RULES[i];
+    for (var h = 0; h < rule.hebrew.length; h++) {
+      if (clean.indexOf(rule.hebrew[h]) > -1) return rule.category;
+    }
+    if (rule.english && rule.english.test(clean)) return rule.category;
   }
   return "Uncategorized";
 }
